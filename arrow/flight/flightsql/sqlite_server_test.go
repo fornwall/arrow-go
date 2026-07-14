@@ -566,6 +566,118 @@ func (s *FlightSqliteServerSuite) TestCommandPreparedStatementQueryWithParams() 
 	s.False(rdr.Next())
 }
 
+func (s *FlightSqliteServerSuite) TestCommandPreparedStatementQueryZeroRowParams() {
+	ctx := context.Background()
+	stmt, err := s.cl.Prepare(ctx, "SELECT * FROM intTable WHERE keyName LIKE ?")
+	s.NoError(err)
+	defer stmt.Close(ctx)
+
+	makeParamBatch := func(typeIDsJSON, offsetsJSON, strJSON string, nrows int64) arrow.RecordBatch {
+		typeIDs := s.fromJSON(arrow.PrimitiveTypes.Int8, typeIDsJSON)
+		defer typeIDs.Release()
+		offsets := s.fromJSON(arrow.PrimitiveTypes.Int32, offsetsJSON)
+		defer offsets.Release()
+		strArray := s.fromJSON(arrow.BinaryTypes.String, strJSON)
+		defer strArray.Release()
+		bytesArr := s.fromJSON(arrow.BinaryTypes.Binary, "[]")
+		defer bytesArr.Release()
+		bigintArr := s.fromJSON(arrow.PrimitiveTypes.Int64, "[]")
+		defer bigintArr.Release()
+		dblArr := s.fromJSON(arrow.PrimitiveTypes.Float64, "[]")
+		defer dblArr.Release()
+		paramArr, _ := array.NewDenseUnionFromArraysWithFields(typeIDs,
+			offsets, []arrow.Array{strArray, bytesArr, bigintArr, dblArr},
+			[]string{"string", "bytes", "bigint", "double"})
+		defer paramArr.Release()
+		return array.NewRecordBatch(arrow.NewSchema([]arrow.Field{
+			{Name: "parameter_1", Type: paramArr.DataType()}}, nil),
+			[]arrow.Array{paramArr}, nrows)
+	}
+
+	// execute once with a bound parameter so the server has previously
+	// seen (and stored) a non-empty binding for this statement
+	batch := makeParamBatch("[0]", "[0]", `["%one"]`, 1)
+	defer batch.Release()
+	stmt.SetParameters(batch)
+	info, err := stmt.Execute(ctx)
+	s.NoError(err)
+	rdr, err := s.cl.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.NoError(err)
+	s.True(rdr.Next())
+	s.EqualValues(2, rdr.RecordBatch().NumRows())
+	s.False(rdr.Next())
+
+	// re-executing with a zero-row binding must replace the previous
+	// parameters: the query runs zero times, yielding zero rows, while
+	// still reporting the real result schema
+	emptyBatch := makeParamBatch("[]", "[]", "[]", 0)
+	defer emptyBatch.Release()
+	stmt.SetParameters(emptyBatch)
+	info, err = stmt.Execute(ctx)
+	s.NoError(err)
+	rdr, err = s.cl.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.NoError(err)
+
+	expectedSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Metadata: s.getColMetadata(sqlite3.SQLITE_INTEGER, ""), Nullable: true},
+		{Name: "keyName", Type: arrow.BinaryTypes.String, Metadata: s.getColMetadata(sqlite3.SQLITE_TEXT, ""), Nullable: true},
+		{Name: "value", Type: arrow.PrimitiveTypes.Int64, Metadata: s.getColMetadata(sqlite3.SQLITE_INTEGER, ""), Nullable: true},
+		{Name: "foreignId", Type: arrow.PrimitiveTypes.Int64, Metadata: s.getColMetadata(sqlite3.SQLITE_INTEGER, ""), Nullable: true}}, nil)
+	s.Truef(expectedSchema.Equal(rdr.Schema()), "expected: %s\ngot: %s", expectedSchema, rdr.Schema())
+	s.False(rdr.Next())
+	s.NoError(rdr.Err())
+}
+
+// A parameter-only expression has no declared column type: SQLite types the
+// result column from the value bound at execution time. The schema reported
+// for a zero-row binding must still match a non-empty execution of the same
+// query, which a NULL probe would not achieve (it leaves the column untyped,
+// yielding the dense-union fallback). Unlike
+// TestCommandPreparedStatementQueryZeroRowParams, which selects from a table
+// whose columns carry declared types, this test fails if the server probes the
+// result schema with NULL.
+func (s *FlightSqliteServerSuite) TestCommandPreparedStatementQueryZeroRowParamsUntypedColumn() {
+	ctx := context.Background()
+	stmt, err := s.cl.Prepare(ctx, "SELECT ?")
+	s.NoError(err)
+	defer stmt.Close(ctx)
+
+	paramSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "p0", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
+
+	execute := func(paramsJSON string) (*arrow.Schema, int64) {
+		rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, paramSchema, strings.NewReader(paramsJSON))
+		s.NoError(err)
+		defer rec.Release()
+
+		stmt.SetParameters(rec)
+		info, err := stmt.Execute(ctx)
+		s.NoError(err)
+		rdr, err := s.cl.DoGet(ctx, info.Endpoint[0].Ticket)
+		s.NoError(err)
+		defer rdr.Release()
+
+		schema, nrows := rdr.Schema(), int64(0)
+		for rdr.Next() {
+			nrows += rdr.RecordBatch().NumRows()
+		}
+		s.NoError(rdr.Err())
+		return schema, nrows
+	}
+
+	// binding a single int64 row types the result column as int64
+	refSchema, nrows := execute(`[{"p0": 42}]`)
+	s.EqualValues(1, nrows)
+	s.Truef(arrow.TypeEqual(arrow.PrimitiveTypes.Int64, refSchema.Field(0).Type),
+		"expected an int64 result column, got: %s", refSchema)
+
+	// the same query bound with zero rows must yield no rows and the very
+	// same schema
+	zeroSchema, nrows := execute(`[]`)
+	s.EqualValues(0, nrows)
+	s.Truef(refSchema.Equal(zeroSchema), "expected: %s\ngot: %s", refSchema, zeroSchema)
+}
+
 func (s *FlightSqliteServerSuite) TestCommandPreparedStatementUpdateNoTable() {
 	ctx := context.Background()
 	stmt, err := s.cl.Prepare(ctx, "INSERT INTO thisTableDoesNotExist (keyName, value) VALUES ('new_value', 2)")

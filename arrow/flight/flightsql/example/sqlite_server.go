@@ -199,6 +199,49 @@ func decodeTransactionQuery(ticket []byte) (txnID, query string, err error) {
 type Statement struct {
 	stmt   *sql.Stmt
 	params [][]interface{}
+	// paramSchema is the schema of the most recently bound parameter
+	// stream, or nil if nothing has been bound. Together with params it
+	// distinguishes a binding with zero rows (params non-nil but empty)
+	// from no binding at all (params nil), and it carries the parameter
+	// types needed to infer the result schema of a zero-row binding.
+	paramSchema *arrow.Schema
+}
+
+// schemaProbeArgs returns one placeholder argument per bound parameter, used
+// solely to discover a prepared statement's result schema when a parameter
+// stream with zero rows was bound and the query therefore yields no rows.
+//
+// SQLite has no static type for the result column of a parameter-only
+// expression such as "SELECT ?": the column type is taken from the value bound
+// at execution time, and a NULL leaves the column untyped, which getArrowType
+// reports as the dense-union fallback. Probing with a NULL would therefore
+// advertise a different schema than a non-empty execution of the same query,
+// so each placeholder is a typed, non-NULL zero value derived from the bound
+// parameter schema. Parameters with no obvious zero value are bound as NULL;
+// their result columns are typed by SQLite's own declared types where those
+// exist. Any rows the probe produces are discarded.
+func schemaProbeArgs(paramSchema *arrow.Schema) []interface{} {
+	if paramSchema == nil {
+		return nil
+	}
+
+	args := make([]interface{}, paramSchema.NumFields())
+	for i, f := range paramSchema.Fields() {
+		switch f.Type.ID() {
+		case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64,
+			arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64:
+			args[i] = int64(0)
+		case arrow.FLOAT32, arrow.FLOAT64:
+			args[i] = float64(0)
+		case arrow.STRING, arrow.LARGE_STRING:
+			args[i] = ""
+		case arrow.BINARY, arrow.LARGE_BINARY:
+			args[i] = []byte{}
+		default:
+			args[i] = nil
+		}
+	}
+	return args
 }
 
 type SQLiteFlightSQLServer struct {
@@ -497,7 +540,7 @@ func (s *SQLiteFlightSQLServer) DoGetPreparedStatement(ctx context.Context, cmd 
 
 	stmt := val.(Statement)
 	readers := make([]array.RecordReader, 0, len(stmt.params))
-	if len(stmt.params) == 0 {
+	if stmt.params == nil {
 		rows, err := stmt.stmt.QueryContext(ctx)
 		if err != nil {
 			return nil, nil, err
@@ -510,6 +553,22 @@ func (s *SQLiteFlightSQLServer) DoGetPreparedStatement(ctx context.Context, cmd 
 
 		schema = rdr.schema
 		readers = append(readers, rdr)
+	} else if len(stmt.params) == 0 {
+		// A parameter stream with zero rows was bound: the query executes
+		// zero times and yields zero rows, but the result schema must still
+		// be reported. Probe for it without emitting any rows.
+		rows, err := stmt.stmt.QueryContext(ctx, schemaProbeArgs(stmt.paramSchema)...)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		rdr, err := NewSqlBatchReader(s.Alloc, rows)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		schema = rdr.schema
+		rdr.Release()
 	} else {
 		defer func() {
 			if err != nil {
@@ -631,6 +690,7 @@ func (s *SQLiteFlightSQLServer) DoPutPreparedStatementQuery(_ context.Context, c
 	}
 
 	stmt.params = args
+	stmt.paramSchema = rdr.Schema()
 	s.prepared.Store(string(cmd.GetPreparedStatementHandle()), stmt)
 	return cmd.GetPreparedStatementHandle(), nil
 }
