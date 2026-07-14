@@ -615,6 +615,56 @@ func (s *FlightSqliteServerSuite) TestCommandPreparedStatementUpdateWithParams()
 	s.EqualValues(4, s.execCountQuery("SELECT COUNT(*) FROM intTable"))
 }
 
+func (s *FlightSqliteServerSuite) TestCommandPreparedStatementUpdateWithDictionaryParams() {
+	ctx := context.Background()
+	stmt, err := s.cl.Prepare(ctx, "INSERT INTO intTable (keyName, value) VALUES (?, 9876)")
+	s.NoError(err)
+	defer stmt.Close(ctx)
+
+	dictType := &arrow.DictionaryType{IndexType: arrow.PrimitiveTypes.Int32, ValueType: arrow.BinaryTypes.String}
+	indices := s.fromJSON(arrow.PrimitiveTypes.Int32, `[0, 1, null]`)
+	dict := s.fromJSON(arrow.BinaryTypes.String, `["apple", "banana"]`)
+	paramArr := array.NewDictionaryArray(dictType, indices, dict)
+	batch := array.NewRecordBatch(arrow.NewSchema([]arrow.Field{
+		{Name: "parameter_1", Type: dictType, Nullable: true}}, nil),
+		[]arrow.Array{paramArr}, 3)
+	defer func() {
+		indices.Release()
+		dict.Release()
+		paramArr.Release()
+		batch.Release()
+	}()
+
+	stmt.SetParameters(batch)
+	s.EqualValues(4, s.execCountQuery("SELECT COUNT(*) FROM intTable"))
+	n, err := stmt.ExecuteUpdate(ctx)
+	s.NoError(err)
+	s.EqualValues(3, n)
+
+	info, err := s.cl.Execute(ctx, "SELECT keyName FROM intTable WHERE value = 9876 ORDER BY id")
+	s.NoError(err)
+	rdr, err := s.cl.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.NoError(err)
+	defer rdr.Release()
+
+	expectedSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "keyName", Type: arrow.BinaryTypes.String, Metadata: s.getColMetadata(sqlite3.SQLITE_TEXT, ""), Nullable: true}}, nil)
+	keyNameArr := s.fromJSON(arrow.BinaryTypes.String, `["apple", "banana", null]`)
+	defer keyNameArr.Release()
+	expected := array.NewRecordBatch(expectedSchema, []arrow.Array{keyNameArr}, 3)
+	defer expected.Release()
+
+	s.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	s.Truef(array.RecordEqual(expected, rec), "expected: %s\ngot: %s", expected, rec)
+	s.False(rdr.Next())
+
+	n, err = s.cl.ExecuteUpdate(ctx, "DELETE FROM intTable WHERE value = 9876")
+	s.NoError(err)
+	s.EqualValues(3, n)
+	s.EqualValues(4, s.execCountQuery("SELECT COUNT(*) FROM intTable"))
+}
+
 func (s *FlightSqliteServerSuite) TestCommandPreparedStatementUpdate() {
 	ctx := context.Background()
 	stmt, err := s.cl.Prepare(ctx, "INSERT INTO intTable (keyName, value) VALUES ('new_value', 999)")
