@@ -1269,7 +1269,10 @@ func (p *PreparedStatement) ExecuteUpdate(ctx context.Context, opts ...grpc.Call
 }
 
 func (p *PreparedStatement) hasBindParameters() bool {
-	return (p.paramBinding != nil && p.paramBinding.NumRows() > 0) || (p.streamBinding != nil)
+	// A binding with zero rows must still be sent to the server: it replaces
+	// any previously bound parameters, and servers may need the parameter
+	// schema to answer a subsequent GetFlightInfo/GetSchema correctly.
+	return p.paramBinding != nil || p.streamBinding != nil
 }
 
 func (p *PreparedStatement) bindParameters(ctx context.Context, desc *pb.FlightDescriptor, opts ...grpc.CallOption) (*flight.FlightDescriptor, error) {
